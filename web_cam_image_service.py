@@ -39,7 +39,10 @@ class UndistortedWebCam(CameraInterface):
 
         self.cameramtx, self.dist_coeff = cameramtx, dist_coeff
 
-        if calibration_file:
+        if not calibration_file:
+            calibration_file = device_name+'.yaml'
+
+        if os.path.isfile(calibration_file):
             with open(calibration_file, 'r') as file:
                 cal = yaml.safe_load(file)
                 assert all(key in cal for key in ('width','height','camera_matrix','distortion_coefficients')), f'malformed calibration file `{calibration_file}`: {cal}'
@@ -230,11 +233,12 @@ def device_name_to_source_name(device_name):
 
 def make_webcam_image_service(bosdyn_sdk_robot, service_name, device_names,
                               show_debug_information=False, logger=None, codec="",
-                              res_width=-1, res_height=-1):
+                              res_width=-1, res_height=-1, calibration_file=None):
     image_sources = []
     for device in device_names:
         web_cam = UndistortedWebCam(device, show_debug_information=show_debug_information, codec=codec,
-                         res_width=res_width, res_height=res_height)
+                                    res_width=res_width, res_height=res_height, 
+                                    calibration_file=calibration_file)
         img_src = VisualImageSource(web_cam.image_source_name, web_cam, rows=web_cam.rows,
                                     cols=web_cam.cols, gain=web_cam.camera_gain,
                                     exposure=web_cam.camera_exposure,
@@ -244,14 +248,15 @@ def make_webcam_image_service(bosdyn_sdk_robot, service_name, device_names,
 
 
 def run_service(bosdyn_sdk_robot, port, service_name, device_names, show_debug_information=False,
-                logger=None, codec="", res_width=-1, res_height=-1):
+                logger=None, codec="", res_width=-1, res_height=-1, calibration_file=None):
     # Proto service specific function used to attach a servicer to a server.
     add_servicer_to_server_fn = image_service_pb2_grpc.add_ImageServiceServicer_to_server
 
     # Instance of the servicer to be run.
     service_servicer = make_webcam_image_service(bosdyn_sdk_robot, service_name, device_names,
                                                  show_debug_information, logger=logger, codec=codec,
-                                                 res_width=res_width, res_height=res_height)
+                                                 res_width=res_width, res_height=res_height,
+                                                 calibration_file=calibration_file)
     return GrpcServiceRunner(service_servicer, add_servicer_to_server_fn, port, logger=logger)
 
 
@@ -269,7 +274,8 @@ def add_web_cam_arguments(parser):
     parser.add_argument('--res-width', required=False, type=int, default=-1, help="Resolution width (pixels).")
     parser.add_argument('--res-height', required=False, type=int, default=-1, help="Resolution height (pixels).")
 
-    parser.add_argument('--calibration-file', required=False, type=str, default="", help="Distortion parameters.")
+    parser.add_argument('--calibration-file', required=False, type=str, default="", 
+                        help="Distortion parameters. Applied to all cameras")
 
 if __name__ == '__main__':
     # Define all arguments used by this service.
