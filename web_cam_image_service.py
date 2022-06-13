@@ -6,8 +6,10 @@
 
 """Register and run the Web Cam Service."""
 
+from concurrent.futures import thread
 import logging
 import os
+import threading
 import time
 import cv2
 import numpy as np
@@ -20,14 +22,39 @@ from bosdyn.client.util import setup_logging
 from bosdyn.client.server_util import GrpcServiceRunner
 from bosdyn.api import image_pb2
 from bosdyn.api import image_service_pb2_grpc
+from bosdyn.api import geometry_pb2 as geom
+from bosdyn.client.frame_helpers import *
+from bosdyn.client.robot_state import RobotStateClient
+from bosdyn.client.graph_nav import GraphNavClient
+
+
 from bosdyn.client.image_service_helpers import (VisualImageSource, CameraBaseImageServicer,
                                                  CameraInterface, convert_RGB_to_grayscale)
+from bosdyn.client.async_tasks import AsyncPeriodicQuery,AsyncTasks
 
 DIRECTORY_NAME = 'web-cam-service'
 AUTHORITY = 'robot-web-cam'
 SERVICE_TYPE = 'bosdyn.api.ImageService'
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class AsyncRobotState(AsyncPeriodicQuery):
+    def __init__(self, robot_state_client):
+        super().__init__("robot_state", robot_state_client, _LOGGER,
+                                              period_sec=0.1)
+
+    def _start_query(self):
+        return self._client.get_robot_state_async()
+
+
+class AsyncLocalization(AsyncPeriodicQuery):
+    def __init__(self, graph_nav_client):
+        super().__init__("localization_status", graph_nav_client, _LOGGER,
+                                              period_sec=0.1)
+
+    def _start_query(self):
+        return self._client.get_localization_state_async()
 
 class UndistortedWebCam(CameraInterface):
     """Provide access to the latest web cam data using openCV's VideoCapture."""
@@ -224,11 +251,79 @@ class UndistortedWebCam(CameraInterface):
 
    
 
+def _update_thread(async_task, stop_event):
+    while not stop_event.is_set():
+        async_task.update()
+        time.sleep(0.01)
+
+
+class BodyFixedVisualImageSource(VisualImageSource):
+    def __init__(self, image_name, camera_interface, static_transforms, rows=None, cols=None, gain=None, exposure=None, pixel_formats=..., logger=None):
+        super().__init__(image_name, camera_interface, rows, cols, gain, exposure, pixel_formats, logger)
+
+        #dict of parent_frame_name to SE3Pose
+        self.static_transforms = static_transforms
+
+
+class SpatiallyCorrelatedCameraImageServicer(CameraBaseImageServicer):
+    def __init__(self, bosdyn_sdk_robot, service_name, image_sources, logger=None, use_background_capture_thread=True):
+        super().__init__(bosdyn_sdk_robot, service_name, image_sources, logger, use_background_capture_thread)
+
+        self._robot_state_client = self.bosdyn_sdk_robot.ensure_client(RobotStateClient.default_service_name)
+        self._graph_nav_client = self.bosdyn_sdk_robot.ensure_client(GraphNavClient.default_service_name)
+
+        self._robot_state_task = AsyncRobotState(self._robot_state_client)
+        self._localization_task = AsyncLocalization(self._graph_nav_client)
+
+        _task_list = [self._robot_state_task, self._localization_task]
+        _async_tasks = AsyncTasks(_task_list)
+
+        self._stop_signal = threading.Event()
+        self._async_updates_thread = threading.Thread(target=_update_thread, args=[_async_tasks, self._stop_signal])
+        self._async_updates_thread.daemon = True
+        self._async_updates_thread.start()
+
+
+    def GetImage(self, request, context):
+        response = super().GetImage(request, context)
+        kinematic_state = self._robot_state_task.proto[0].kinematic_state
+        
+        #start with available base transforms as child_frame_name:(parent_frame_name, SE3Pose)
+        edges = {item.key:item.value for item in kinematic_state.transforms_snapshot.child_to_parent_edge_map}
+
+        for img_resp in response.image_responses:
+            #add edges for known static transforms
+            src_name = img_resp.source.name
+            available_static_transforms = self.image_sources_mapped[src_name].static_transforms
+            common_frames = set(available_static_transforms.keys()).intersection(set(edges.keys()))
+            assert common_frames, "no common frames detected"
+            for frame_name in common_frames:
+                edges = add_edge_to_tree(edges, available_static_transforms[frame_name], frame_name, f'webcam_{src_name}')
+
+            #add edges for localization-based transforms if localization is valid
+            if self._localization_task.proto[0].localization:
+                localization = self._localization_task.proto[0].localization
+                if localization.waypoint_id != '':
+                    edges = add_edge_to_tree(edges, localization.waypoint_tform_body, BODY_FRAME_NAME, f'waypoint_{localization.waypoint_id}')
+
+            img_resp.shot.transforms_snapshot = geom.FrameTreeSnapshot(child_to_parent_edge_map=edges)
+            img_resp.shot.frame_name_image_sensor = f'webcam_{src_name}'
+
+        return response
+
+    def __del__(self):
+        super().__del__()
+        self._stop_signal.set()
+        self._async_updates_thread.join()
+
+
 def device_name_to_source_name(device_name):
     if type(device_name) == int:
         return "video" + str(device_name)
     else:
         return os.path.basename(device_name)
+
+
 
 
 def make_webcam_image_service(bosdyn_sdk_robot, service_name, device_names,
@@ -239,12 +334,12 @@ def make_webcam_image_service(bosdyn_sdk_robot, service_name, device_names,
         web_cam = UndistortedWebCam(device, show_debug_information=show_debug_information, codec=codec,
                                     res_width=res_width, res_height=res_height, 
                                     calibration_file=calibration_file)
-        img_src = VisualImageSource(web_cam.image_source_name, web_cam, rows=web_cam.rows,
+        img_src = BodyFixedVisualImageSource(web_cam.image_source_name, web_cam, rows=web_cam.rows,
                                     cols=web_cam.cols, gain=web_cam.camera_gain,
                                     exposure=web_cam.camera_exposure,
                                     pixel_formats=web_cam.supported_pixel_formats)
         image_sources.append(img_src)
-    return CameraBaseImageServicer(bosdyn_sdk_robot, service_name, image_sources, logger)
+    return SpatiallyCorrelatedCameraImageServicer(bosdyn_sdk_robot, service_name, image_sources, logger)
 
 
 def run_service(bosdyn_sdk_robot, port, service_name, device_names, show_debug_information=False,
@@ -261,15 +356,11 @@ def run_service(bosdyn_sdk_robot, port, service_name, device_names, show_debug_i
 
 
 def add_web_cam_arguments(parser):
-    parser.add_argument(
-        '--device-name',
-        help=('Image source to query. If none are passed, it will default to the first available '
-              'source.'), action='append', required=False, default=[])
-    parser.add_argument(
-        '--show-debug-info', action='store_true', required=False,
+    parser.add_argument('--device-name', action='append', required=False, default=[],
+        help=('Image source to query. If none are passed, it will default to the first available source.'))
+    parser.add_argument( '--show-debug-info', action='store_true', required=False,
         help="If passed, openCV will try to display the captured web cam images.")
-    parser.add_argument(
-        '--codec', required=False, help="The four character video codec (compression format). For example, " +\
+    parser.add_argument( '--codec', required=False, help="The four character video codec (compression format). For example, " +\
         "this is commonly 'DIVX' on windows or 'MJPG' on linux.", default="")
     parser.add_argument('--res-width', required=False, type=int, default=-1, help="Resolution width (pixels).")
     parser.add_argument('--res-height', required=False, type=int, default=-1, help="Resolution height (pixels).")
