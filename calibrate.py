@@ -1,5 +1,6 @@
 import logging
 from os import path
+import os
 from typing import Optional
 import numpy as np
 import cv2
@@ -25,6 +26,34 @@ def imgdir_gen(img_glob: str):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         yield gray
         
+
+class CoverageTracker:
+    def __init__(self, pixel_x, pixel_y, bin_x, bin_y) -> None:
+        self.accumulator = np.zeros((bin_x, bin_y), dtype=np.uint32)
+        self.x_scale = pixel_x/bin_x
+        self.y_scale = pixel_y/bin_y
+        self.bin_count = bin_x*bin_y
+
+    def add_points(self, corners, usefulness):
+        points = np.squeeze(corners)
+
+        indices = points/np.array([[self.x_scale,self.y_scale]])[:,None]
+        indices = indices.astype(int)
+        print(indices)
+        print(indices.shape)
+        print(self.accumulator[indices])
+        if np.all(self.accumulator[indices] > usefulness):
+            print('rejecting img')
+            return
+
+        np.add.at(self.accumulator, indices, 1)
+        # print(self.accumulator)
+
+    def meets_threshold(self, min_count, fraction):
+        self.accumulator > min_count
+        print(self.accumulator > min_count)
+        return np.count_nonzero(self.accumulator > min_count)/self.bin_count > fraction
+
 class Calibrator:
     def __init__(self, 
                     data_source:str, 
@@ -32,7 +61,8 @@ class Calibrator:
                     height:int, 
                     output_file_name:Optional[str]=None, 
                     draw_visuals:bool=True, 
-                    save_images:bool=False) -> None:
+                    save_images:bool=False,
+                    output_dir:str=".") -> None:
         
         self.draw_visuals = draw_visuals
         self.save_images = save_images
@@ -74,6 +104,13 @@ class Calibrator:
             output_file_name+='.yaml'
         self.save_name = output_file_name
 
+        if not path.isdir(output_dir):
+            os.makedirs(output_dir)
+
+        self.output_dir=output_dir
+
+        self.ct = CoverageTracker(self.width, self.height, 12, 12)
+
 
     def run(self, img_count):
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
@@ -97,19 +134,23 @@ class Calibrator:
                 corners2 = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
                 logging.debug(corners2)
                 imgpoints.append(corners2)
+                self.ct.add_points(corners2,30)
                 # Draw and display the corners
                 if self.save_images:
-                    cv2.imwrite(f'capture{capture_count:03}.png', gray, [int(cv2.IMWRITE_PNG_COMPRESSION),0])
+                    file_name = path.join(self.output_dir, f'capture{capture_count:03}.png')
+                    cv2.imwrite(file_name, gray, [int(cv2.IMWRITE_PNG_COMPRESSION),0])
                 if self.draw_visuals:
                     cv2.drawChessboardCorners(gray, CHECKERBOARD_DIMS, corners2, ret)
-                    cv2.imshow('capture', gray)
-                    cv2.waitKey(100)
                 
-                if self._check_coverage(imgpoints, (self.width, self.height)):
+                if self.ct.meets_threshold(30, 0.95):
                     break
                 
                 if capture_count >= img_count:
                     break
+
+            if self.draw_visuals:
+                cv2.imshow('capture', gray)
+                cv2.waitKey(100)
 
         logging.info(f'starting calibration with {capture_count} images')
         ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
@@ -119,6 +160,7 @@ class Calibrator:
         logging.info(f'{dist}')
 
         w_h = (self.width, self.height)
+        #using 0 for the alpha scale parameter means the result is the same size as the original image, but contains only valid pixels
         newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, w_h, 0, w_h)
         logging.info(f'camera matrix (after undistortion):')
         logging.info(f'{newcameramtx}')
@@ -132,11 +174,13 @@ class Calibrator:
         params['distortion_coefficients'] = dist.tolist()
 
         if self.save_name:
-            with open(f'{self.save_name}','w') as file:
+            file_name = path.join(self.output_dir, self.save_name)
+            with open(file_name,'w') as file:
                 yaml.dump(params, file)
         
         if self.save_images:
-            cv2.imwrite(f'undistorted.jpg', undistorted)
+            file_name = path.join(self.output_dir, 'undistorted.jpg')
+            cv2.imwrite(file_name, undistorted)
         
         if self.draw_visuals:
             cv2.imshow('undistorted', undistorted)
@@ -144,16 +188,7 @@ class Calibrator:
             cv2.destroyAllWindows()
         
             
-    def _check_coverage(self, imgpoints, img_size):
-        print(len(imgpoints))
-        print(imgpoints[-1].shape)
 
-        for point_set in imgpoints:
-            for point in point_set:
-                x= point[0][0]
-                y=point[0][1]
-                print((x,y))
-        return False
         
 
 if __name__=='__main__':
@@ -167,6 +202,7 @@ if __name__=='__main__':
 
     parser.add_argument('-v', '--draw-visuals', action="store_true", help="Render images to screen.")
     parser.add_argument('-i', '--save-images', action="store_true", help="Save images to disk.")
+    parser.add_argument('-d', '--save_directory', required=False, type=str, default=".", help="Change to directory before starting.")
 
     options = parser.parse_args()
     c = Calibrator(data_source=options.source, 
@@ -174,5 +210,6 @@ if __name__=='__main__':
                     height=options.res_height, 
                     output_file_name=options.output_file_name,
                     draw_visuals=options.draw_visuals,
-                    save_images=options.save_images)
-    c.run(30)
+                    save_images=options.save_images,
+                    output_dir=options.save_directory)
+    c.run(30000)

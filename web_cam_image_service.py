@@ -7,6 +7,7 @@
 """Register and run the Web Cam Service."""
 
 from concurrent.futures import thread
+from copy import deepcopy
 import logging
 import os
 import threading
@@ -56,7 +57,7 @@ class AsyncLocalization(AsyncPeriodicQuery):
     def _start_query(self):
         return self._client.get_localization_state_async()
 
-class UndistortedWebCam(CameraInterface):
+class CalibratedWebCam(CameraInterface):
     """Provide access to the latest web cam data using openCV's VideoCapture."""
 
     def __init__(self, device_name, fps=30, show_debug_information=False, codec="",
@@ -64,11 +65,14 @@ class UndistortedWebCam(CameraInterface):
 
         self.show_debug_images = show_debug_information
 
+        #try to set these directly if provided
         self.cameramtx, self.dist_coeff = cameramtx, dist_coeff
 
+        self.extrinisic_params = None
+
+        #but the calibration file always wins
         if not calibration_file:
             calibration_file = device_name+'.yaml'
-
         if os.path.isfile(calibration_file):
             with open(calibration_file, 'r') as file:
                 cal = yaml.safe_load(file)
@@ -77,6 +81,7 @@ class UndistortedWebCam(CameraInterface):
                 res_height = cal['height']
                 self.cameramtx = np.array(cal['camera_matrix'])
                 self.dist_coeff = np.array(cal['distortion_coefficients'])
+                self.extrinisic_params = cal['extrinsics']
 
 
         # Check if the user is passing an index to a camera port, i.e. "0" to get the first
@@ -157,7 +162,7 @@ class UndistortedWebCam(CameraInterface):
                 self.supported_pixel_formats = [image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8,
                 image_pb2.Image.PIXEL_FORMAT_RGB_U8, image_pb2.Image.PIXEL_FORMAT_RGBA_U8]
 
-        #using 0 for the alpha scale parameter means the result is the same size as the original image, but contains all valid pixels
+        #using 0 for the alpha scale parameter means the result is the same size as the original image, but contains only valid pixels
         self.do_unidstort = self.cameramtx is not None and self.dist_coeff is not None
         if self.do_unidstort:
             self.newcameramtx, self.roi = cv2.getOptimalNewCameraMatrix(self.cameramtx, self.dist_coeff, (self.rows,self.cols), 0, (self.rows,self.cols))
@@ -257,7 +262,7 @@ def _update_thread(async_task, stop_event):
         time.sleep(0.01)
 
 
-class BodyFixedVisualImageSource(VisualImageSource):
+class CalibratedVisualImageSource(VisualImageSource):
     def __init__(self, image_name, camera_interface, static_transforms, rows=None, cols=None, gain=None, exposure=None, pixel_formats=..., logger=None):
         super().__init__(image_name, camera_interface, rows, cols, gain, exposure, pixel_formats, logger)
 
@@ -286,23 +291,25 @@ class SpatiallyCorrelatedCameraImageServicer(CameraBaseImageServicer):
 
     def GetImage(self, request, context):
         response = super().GetImage(request, context)
-        kinematic_state = self._robot_state_task.proto[0].kinematic_state
-        
-        #start with available base transforms as child_frame_name:(parent_frame_name, SE3Pose)
-        edges = {item.key:item.value for item in kinematic_state.transforms_snapshot.child_to_parent_edge_map}
+        kinematic_state = self._robot_state_task.proto.kinematic_state
+        frame_map = kinematic_state.transforms_snapshot.child_to_parent_edge_map
+
+        existing_frames = get_frame_names(kinematic_state.transforms_snapshot)
 
         for img_resp in response.image_responses:
+            #initialize mutable edge map
+            edges = {frame:frame_map[frame] for frame in frame_map}
             #add edges for known static transforms
             src_name = img_resp.source.name
-            available_static_transforms = self.image_sources_mapped[src_name].static_transforms
-            common_frames = set(available_static_transforms.keys()).intersection(set(edges.keys()))
-            assert common_frames, "no common frames detected"
+            image_transforms = self.image_sources_mapped[src_name].static_transforms
+            common_frames = set(image_transforms.keys()).intersection(set(existing_frames))
+            self.logger.warning(f'no common frames: {image_transforms.keys()} vs {edges.keys}')
             for frame_name in common_frames:
-                edges = add_edge_to_tree(edges, available_static_transforms[frame_name], frame_name, f'webcam_{src_name}')
+                edges = add_edge_to_tree(edges, image_transforms[frame_name], frame_name, f'webcam_{src_name}')
 
             #add edges for localization-based transforms if localization is valid
             if self._localization_task.proto[0].localization:
-                localization = self._localization_task.proto[0].localization
+                localization = self._localization_task.proto.localization
                 if localization.waypoint_id != '':
                     edges = add_edge_to_tree(edges, localization.waypoint_tform_body, BODY_FRAME_NAME, f'waypoint_{localization.waypoint_id}')
 
@@ -331,11 +338,11 @@ def make_webcam_image_service(bosdyn_sdk_robot, service_name, device_names,
                               res_width=-1, res_height=-1, calibration_file=None):
     image_sources = []
     for device in device_names:
-        web_cam = UndistortedWebCam(device, show_debug_information=show_debug_information, codec=codec,
+        web_cam = CalibratedWebCam(device, show_debug_information=show_debug_information, codec=codec,
                                     res_width=res_width, res_height=res_height, 
                                     calibration_file=calibration_file)
-        img_src = BodyFixedVisualImageSource(web_cam.image_source_name, web_cam, rows=web_cam.rows,
-                                    cols=web_cam.cols, gain=web_cam.camera_gain,
+        img_src = CalibratedVisualImageSource(web_cam.image_source_name, web_cam, web_cam.extrinisic_params,
+                                    rows=web_cam.rows, cols=web_cam.cols, gain=web_cam.camera_gain,
                                     exposure=web_cam.camera_exposure,
                                     pixel_formats=web_cam.supported_pixel_formats)
         image_sources.append(img_src)
