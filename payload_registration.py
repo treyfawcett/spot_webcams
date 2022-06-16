@@ -20,6 +20,9 @@ from bosdyn.client.payload import PayloadClient
 from bosdyn.client.payload_registration import PayloadRegistrationClient, PayloadRegistrationKeepAlive
 import bosdyn.client.util
 
+from bosdyn.client.frame_helpers import *
+from bosdyn.client.math_helpers import *
+
 import bosdyn.api.payload_pb2 as payload_protos
 import bosdyn.api.robot_id_pb2 as robot_id_protos
 
@@ -57,8 +60,8 @@ def payload_registrant(config):
     payload.version.minor_version = 0
     payload.version.patch_level = 1
     # note: this field is not required, but highly recommended
-    payload.mount_frame_name = config.payload_namme
-
+    payload.mount_frame_name = payload_protos.MOUNT_FRAME_BODY_PAYLOAD
+    
     # Register the payload
     payload_registration_client.register_payload(payload, payload_secret)
 

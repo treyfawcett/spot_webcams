@@ -30,7 +30,8 @@ from bosdyn.client.graph_nav import GraphNavClient
 
 
 from bosdyn.client.image_service_helpers import (VisualImageSource, CameraBaseImageServicer,
-                                                 CameraInterface, convert_RGB_to_grayscale)
+                                                 CameraInterface, ImageCaptureThread,
+                                                 convert_RGB_to_grayscale)
 from bosdyn.client.async_tasks import AsyncPeriodicQuery,AsyncTasks
 
 DIRECTORY_NAME = 'web-cam-service'
@@ -268,6 +269,17 @@ class CalibratedVisualImageSource(VisualImageSource):
 
         #dict of parent_frame_name to SE3Pose
         self.static_transforms = static_transforms
+    
+    def create_capture_thread(self):
+        """Initialize a background thread to continuously capture images.
+
+        Args:
+            capture_period (int): Amount of time (in seconds) between captures to wait
+                                  before triggering the next capture. Defaults to
+                                  "no wait" between captures.
+        """
+        self.capture_thread = ImageCaptureThread(self.image_source_name, self.capture_function, 0.0)
+        self.capture_thread.start_capturing()
 
 
 class SpatiallyCorrelatedCameraImageServicer(CameraBaseImageServicer):
